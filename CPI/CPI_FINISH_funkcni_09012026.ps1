@@ -17,8 +17,7 @@ $encodedCreds = [System.Convert]::ToBase64String([System.Text.Encoding]::ASCII.G
 $basicAuthValue = "Basic $encodedCreds"
 $Headers = @{
     Authorization = $basicAuthValue
-    "Content-Type" = "application/json"
-    Accept = "application/json"
+    ContentType="charset=utf -8"
 }
 
 # FUNCTIONS ---------------------------------------------------------------------------------------------------------------------------------------
@@ -32,6 +31,16 @@ function GetObjId{
     $id=$content.Substring($pos+11, 40)
     return $id
 }
+
+#tagexists 
+function TagExists {
+    Param([string]$tagName)
+
+    $uri = "$PROJECT_URI/_apis/git/repositories/$REPO_NAME/refs?filter=tags/$tagName&api-version=6.0"
+    $resp = Invoke-RestMethod -Uri $uri -Headers $Headers -Method GET
+    return ($resp.count -gt 0)
+}
+
 
 # FUNCTION - Get merge Id
 function GetMergeId{
@@ -68,55 +77,21 @@ function GetPullRequestId{
     [int]$cdId=$content.IndexOf("codeReviewId")
     [int]$prId=$content.Substring($pos+15, $cdId-$pos-17)
     [string]$prId=[int]$prId
-    echo "Pull Request ID: $prId"
     return $prId
 }
 
 # FUNCTION - Get Pull Request Status
-function GetPullRequestStatus {
-    param([string]$prId)
+function GetPullRequestStatus{
+    Param([string]$prId)
 
-    $Uri = "$PROJECT_URI/_apis/git/repositories/$REPO_NAME/pullRequests/$prId?api-version=6.0"
-    $resp = Invoke-RestMethod -Uri $Uri -Headers $Headers -UseBasicParsing
-
-    return @{
-        Status      = $resp.status       # active | completed | abandoned
-        MergeStatus = $resp.mergeStatus  # succeeded | conflicts | queued | notSet
-    }
+    $Uri = "$PROJECT_URI/_apis/git/repositories/$REPO_NAME/pullRequests/$prId" + "?api-version=6.0"
+    $RESP=@(Invoke-WebRequest -Uri $Uri -Headers $Headers -UseBasicParsing)
+    [string]$content = $RESP
+    [int]$pos=$content.IndexOf("status")
+    [int]$end=$content.IndexOf("createdBy")
+    $status=$content.Substring($pos+9, $end-$pos-12)
+    return $status
 }
-
-
-# FUNCTION - Get existing active pull request for source/target pair
-function GetExistingPullRequest {
-    Param([string]$srcbranch, [string]$trgbranch)
-
-    $sourceRef = [System.Uri]::EscapeDataString("refs/heads/$srcbranch")
-    $targetRef = [System.Uri]::EscapeDataString("refs/heads/$trgbranch")
-    $Uri = "$PROJECT_URI/_apis/git/repositories/$REPO_NAME/pullRequests?searchCriteria.status=active&searchCriteria.sourceRefName=$sourceRef&searchCriteria.targetRefName=$targetRef&api-version=6.0"
-    $resp = Invoke-RestMethod -Uri $Uri -Headers $Headers -UseBasicParsing
-
-    if ($resp.value -and $resp.value.Count -gt 0) {
-        Write-Host "Found existing PR $($resp.value[0].pullRequestId) for $srcbranch -> $trgbranch."
-        return ($resp.value[0] | ConvertTo-Json -Depth 32)
-    }
-
-    return $null
-}
-
-
-# FUNCTION - Get existing PR or create a new one
-function GetOrCreatePullRequest {
-    Param([string]$srcbranch, [string]$trgbranch)
-
-    $existing = GetExistingPullRequest -srcbranch $srcbranch -trgbranch $trgbranch
-    if ($existing) {
-        return $existing
-    }
-
-    Write-Host "No existing PR found for $srcbranch -> $trgbranch. Creating a new one..."
-    return (CreatePullRequest -srcbranch $srcbranch -trgbranch $trgbranch)
-}
-
 
 # FUNCTION - Complete Pull Request
 function CompletePullRequest{
@@ -138,6 +113,14 @@ function CompletePullRequest{
 
 # FUNCTION - TagMasterWithVersion
 function TagMasterWithVersion{
+
+     if (TagExists -tagName $RELEASE_VERSION) {
+        Write-Output "TAG $RELEASE_VERSION už existuje, krok tagování přeskočen."
+        
+        return
+    }
+
+
     $objId = GetObjId -branch master
     $body = @{
         "message"="CICD tag for version $RELEASE_VERSION"
@@ -150,52 +133,39 @@ function TagMasterWithVersion{
 }
 # FUNCTIONS end -----------------------------------------------------------------------------------------------------------------------------------
 
-echo "FINDING OR CREATING PULL REQUEST TO MERGE $BRANCH_NAME IN DEVELOP..."
-$response = GetOrCreatePullRequest -srcbranch $BRANCH_NAME -trgbranch "develop"
+echo "CREATING PULL REQUEST TO MERGE $BRANCH_NAME IN DEVELOP..."
+$response = CreatePullRequest -srcbranch $BRANCH_NAME -trgbranch "develop"
 $prId = GetPullRequestId -resp $response
-$pr = GetPullRequestStatus -prId $prId
-if ($pr.MergeStatus -eq "conflicts") {
-    Write-Error "❌ PR $prId has merge conflicts. Resolve manually in Azure DevOps."
-}
-while ($pr.Status -ne "active") {
-    Start-Sleep -Seconds 5
-    $pr = GetPullRequestStatus -prId $prId
-    Write-Host "PR Status: $($pr.Status), MergeStatus: $($pr.MergeStatus)"
+$status = GetPullRequestStatus -prId $prId
+while($status -ne "active"){
+    $status = GetPullRequestStatus -prId $prId
 }
 
 echo "COMPLETING PULL REQUEST TO MERGE $BRANCH_NAME IN DEVELOP..."
 CompletePullRequest -resp $response
-$pr = GetPullRequestStatus -prId $prId
-while ($pr.Status -ne "completed") {
-    Start-Sleep -Seconds 5
-    $pr = GetPullRequestStatus -prId $prId
-    Write-Host "PR Status: $($pr.Status), MergeStatus: $($pr.MergeStatus)"
+$status = GetPullRequestStatus -prId $prId
+while($status -ne "completed"){
+    Start-Sleep -Seconds 3
+    $status = GetPullRequestStatus  -prId $prId
 }
 
 
 
-echo "FINDING OR CREATING PULL REQUEST TO MERGE $BRANCH_NAME IN MASTER..."
-$response = GetOrCreatePullRequest -srcbranch $BRANCH_NAME -trgbranch "master"
+echo "CREATING PULL REQUEST TO MERGE $BRANCH_NAME IN MASTER..."
+$response = CreatePullRequest -srcbranch $BRANCH_NAME -trgbranch "master"
 $prId = GetPullRequestId -resp $response
-$pr = GetPullRequestStatus -prId $prId
-if ($pr.MergeStatus -eq "conflicts") {
-    Write-Error "❌ PR $prId has merge conflicts. Resolve manually in Azure DevOps."
-}
-while ($pr.Status -ne "active") {
-    Start-Sleep -Seconds 5
-    $pr = GetPullRequestStatus -prId $prId
-    Write-Host "PR Status: $($pr.Status), MergeStatus: $($pr.MergeStatus)"
+$status = GetPullRequestStatus -prId $prId
+while($status -ne "active"){
+    $status = GetPullRequestStatus -prId $prId
 }
 
 echo "COMPLETING PULL REQUEST TO MERGE $BRANCH_NAME IN MASTER..."
 CompletePullRequest -resp $response
-$pr = GetPullRequestStatus -prId $prId
-while ($pr.Status -ne "completed") {
-    Start-Sleep -Seconds 5
-    $pr = GetPullRequestStatus -prId $prId
-    Write-Host "PR Status: $($pr.Status), MergeStatus: $($pr.MergeStatus)"
+$status = GetPullRequestStatus -prId $prId
+while($status -ne "completed"){
+    Start-Sleep -Seconds 3
+    $status = GetPullRequestStatus -prId $prId
 }
-
 
 # Tag master with version
 echo "ADDING NEW TAG WITH NEW VERSION $RELEASE_VERSION TO MASTER BRANCH..."
